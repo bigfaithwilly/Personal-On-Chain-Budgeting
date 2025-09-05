@@ -5,8 +5,12 @@
 (define-constant ERR_INSUFFICIENT_BUDGET (err u103))
 (define-constant ERR_INVALID_AMOUNT (err u104))
 (define-constant ERR_INVALID_PERIOD (err u105))
+(define-constant ERR_GOAL_NOT_FOUND (err u106))
+(define-constant ERR_GOAL_COMPLETED (err u107))
+(define-constant ERR_DEADLINE_PASSED (err u108))
 
 (define-data-var next-budget-id uint u1)
+(define-data-var next-goal-id uint u1)
 
 (define-map budgets
   { user: principal, budget-id: uint }
@@ -46,6 +50,35 @@
 )
 
 (define-data-var next-expense-id uint u1)
+
+(define-map savings-goals
+  { user: principal, goal-id: uint }
+  {
+    name: (string-ascii 50),
+    target-amount: uint,
+    current-saved: uint,
+    deadline: uint,
+    created: uint,
+    active: bool,
+    completed: bool
+  }
+)
+
+(define-map goal-contributions
+  { user: principal, goal-id: uint, contribution-id: uint }
+  {
+    amount: uint,
+    timestamp: uint,
+    description: (string-ascii 100)
+  }
+)
+
+(define-map user-goal-count
+  { user: principal }
+  { count: uint }
+)
+
+(define-data-var next-contribution-id uint u1)
 
 (define-public (create-budget (name (string-ascii 50)) (total-limit uint) (reset-period uint))
   (let (
@@ -284,4 +317,171 @@
 
 (define-read-only (get-next-expense-id)
   (var-get next-expense-id)
+)
+
+(define-public (create-savings-goal (name (string-ascii 50)) (target-amount uint) (deadline-blocks uint))
+  (let (
+    (user tx-sender)
+    (goal-id (var-get next-goal-id))
+    (current-block stacks-block-height)
+    (goal-deadline (+ current-block deadline-blocks))
+  )
+    (asserts! (> target-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> deadline-blocks u0) ERR_INVALID_PERIOD)
+    
+    (map-set savings-goals
+      { user: user, goal-id: goal-id }
+      {
+        name: name,
+        target-amount: target-amount,
+        current-saved: u0,
+        deadline: goal-deadline,
+        created: current-block,
+        active: true,
+        completed: false
+      }
+    )
+    
+    (map-set user-goal-count
+      { user: user }
+      { count: (+ (get-user-goal-count user) u1) }
+    )
+    
+    (var-set next-goal-id (+ goal-id u1))
+    (ok goal-id)
+  )
+)
+
+(define-public (contribute-to-goal (goal-id uint) (amount uint) (description (string-ascii 100)))
+  (let (
+    (user tx-sender)
+    (contribution-id (var-get next-contribution-id))
+    (goal-data (unwrap! (get-savings-goal user goal-id) ERR_GOAL_NOT_FOUND))
+    (new-saved (+ (get current-saved goal-data) amount))
+    (current-block stacks-block-height)
+    (is-completed (>= new-saved (get target-amount goal-data)))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (get active goal-data) ERR_GOAL_NOT_FOUND)
+    (asserts! (not (get completed goal-data)) ERR_GOAL_COMPLETED)
+    (asserts! (< current-block (get deadline goal-data)) ERR_DEADLINE_PASSED)
+    
+    (map-set savings-goals
+      { user: user, goal-id: goal-id }
+      (merge goal-data { 
+        current-saved: new-saved,
+        completed: is-completed
+      })
+    )
+    
+    (map-set goal-contributions
+      { user: user, goal-id: goal-id, contribution-id: contribution-id }
+      {
+        amount: amount,
+        timestamp: current-block,
+        description: description
+      }
+    )
+    
+    (var-set next-contribution-id (+ contribution-id u1))
+    (ok { contribution-id: contribution-id, goal-completed: is-completed })
+  )
+)
+
+(define-public (deactivate-savings-goal (goal-id uint))
+  (let (
+    (user tx-sender)
+    (goal-data (unwrap! (get-savings-goal user goal-id) ERR_GOAL_NOT_FOUND))
+  )
+    (asserts! (get active goal-data) ERR_GOAL_NOT_FOUND)
+    (asserts! (not (get completed goal-data)) ERR_GOAL_COMPLETED)
+    
+    (map-set savings-goals
+      { user: user, goal-id: goal-id }
+      (merge goal-data { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (reactivate-savings-goal (goal-id uint))
+  (let (
+    (user tx-sender)
+    (goal-data (unwrap! (get-savings-goal user goal-id) ERR_GOAL_NOT_FOUND))
+    (current-block stacks-block-height)
+  )
+    (asserts! (not (get active goal-data)) ERR_UNAUTHORIZED)
+    (asserts! (not (get completed goal-data)) ERR_GOAL_COMPLETED)
+    (asserts! (< current-block (get deadline goal-data)) ERR_DEADLINE_PASSED)
+    
+    (map-set savings-goals
+      { user: user, goal-id: goal-id }
+      (merge goal-data { active: true })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-savings-goal (user principal) (goal-id uint))
+  (map-get? savings-goals { user: user, goal-id: goal-id })
+)
+
+(define-read-only (get-goal-contribution (user principal) (goal-id uint) (contribution-id uint))
+  (map-get? goal-contributions { user: user, goal-id: goal-id, contribution-id: contribution-id })
+)
+
+(define-read-only (get-user-goal-count (user principal))
+  (default-to u0 (get count (map-get? user-goal-count { user: user })))
+)
+
+(define-read-only (get-goal-progress (user principal) (goal-id uint))
+  (match (get-savings-goal user goal-id)
+    goal-data
+    (let (
+      (progress-percentage (/ (* (get current-saved goal-data) u100) (get target-amount goal-data)))
+      (remaining-amount (- (get target-amount goal-data) (get current-saved goal-data)))
+      (current-block stacks-block-height)
+      (blocks-remaining (if (> (get deadline goal-data) current-block)
+                          (- (get deadline goal-data) current-block)
+                          u0))
+    )
+      (ok {
+        progress-percentage: progress-percentage,
+        remaining-amount: remaining-amount,
+        blocks-remaining: blocks-remaining,
+        is-completed: (get completed goal-data),
+        deadline-passed: (>= current-block (get deadline goal-data))
+      })
+    )
+    ERR_GOAL_NOT_FOUND
+  )
+)
+
+(define-read-only (get-goal-status (user principal) (goal-id uint))
+  (match (get-savings-goal user goal-id)
+    goal-data
+    (let (
+      (current-block stacks-block-height)
+      (deadline-passed (>= current-block (get deadline goal-data)))
+      (is-overdue (and (not (get completed goal-data)) deadline-passed))
+    )
+      (ok {
+        active: (get active goal-data),
+        completed: (get completed goal-data),
+        deadline-passed: deadline-passed,
+        overdue: is-overdue,
+        current-saved: (get current-saved goal-data),
+        target-amount: (get target-amount goal-data)
+      })
+    )
+    ERR_GOAL_NOT_FOUND
+  )
+)
+
+(define-read-only (get-next-goal-id)
+  (var-get next-goal-id)
+)
+
+(define-read-only (get-next-contribution-id)
+  (var-get next-contribution-id)
 )
