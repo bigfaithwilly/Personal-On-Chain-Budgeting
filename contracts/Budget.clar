@@ -8,6 +8,12 @@
 (define-constant ERR_GOAL_NOT_FOUND (err u106))
 (define-constant ERR_GOAL_COMPLETED (err u107))
 (define-constant ERR_DEADLINE_PASSED (err u108))
+(define-constant ERR_INVALID_THRESHOLD (err u109))
+(define-constant ERR_THRESHOLD_NOT_FOUND (err u110))
+(define-constant ERR_THRESHOLD_ALREADY_SET (err u111))
+(define-constant ERR_RECURRING_NOT_FOUND (err u112))
+(define-constant ERR_RECURRING_DISABLED (err u113))
+(define-constant ERR_RECURRING_NOT_DUE (err u114))
 
 (define-data-var next-budget-id uint u1)
 (define-data-var next-goal-id uint u1)
@@ -79,6 +85,35 @@
 )
 
 (define-data-var next-contribution-id uint u1)
+
+(define-map budget-alert-thresholds
+  { user: principal, budget-id: uint, threshold-level: uint }
+  { threshold-percentage: uint }
+)
+
+(define-map threshold-status
+  { user: principal, budget-id: uint, threshold-level: uint }
+  { crossed: bool, crossed-at: uint }
+)
+
+(define-map category-threshold-status
+  { user: principal, budget-id: uint, category: (string-ascii 30), threshold-level: uint }
+  { crossed: bool, crossed-at: uint }
+)
+
+(define-map recurring-expenses
+  { budget-id: uint, recurring-id: uint }
+  {
+    name: (string-ascii 50),
+    amount: uint,
+    frequency: uint,
+    category: (string-ascii 30),
+    enabled: bool,
+    last-executed: uint
+  }
+)
+
+(define-data-var next-recurring-id uint u1)
 
 (define-public (create-budget (name (string-ascii 50)) (total-limit uint) (reset-period uint))
   (let (
@@ -170,6 +205,10 @@
     )
     
     (var-set next-expense-id (+ expense-id u1))
+    
+    (if (is-ok (check-budget-threshold user budget-id new-total-spent (get total-limit budget-data))) true true)
+    (if (is-ok (check-category-threshold user budget-id category new-category-spent (get limit category-data))) true true)
+    
     (ok expense-id)
   )
 )
@@ -484,4 +523,230 @@
 
 (define-read-only (get-next-contribution-id)
   (var-get next-contribution-id)
+)
+
+(define-public (set-budget-threshold (budget-id uint) (threshold-level uint) (threshold-percentage uint))
+  (let (
+    (user tx-sender)
+    (budget-data (unwrap! (get-budget user budget-id) ERR_BUDGET_NOT_FOUND))
+  )
+    (asserts! (and (>= threshold-level u1) (<= threshold-level u3)) ERR_INVALID_THRESHOLD)
+    (asserts! (and (> threshold-percentage u0) (<= threshold-percentage u100)) ERR_INVALID_THRESHOLD)
+    (asserts! (get active budget-data) ERR_BUDGET_NOT_FOUND)
+    
+    (map-set budget-alert-thresholds
+      { user: user, budget-id: budget-id, threshold-level: threshold-level }
+      { threshold-percentage: threshold-percentage }
+    )
+    (ok true)
+  )
+)
+
+(define-public (initialize-default-thresholds (budget-id uint))
+  (let (
+    (user tx-sender)
+    (budget-data (unwrap! (get-budget user budget-id) ERR_BUDGET_NOT_FOUND))
+  )
+    (asserts! (get active budget-data) ERR_BUDGET_NOT_FOUND)
+    
+    (map-set budget-alert-thresholds
+      { user: user, budget-id: budget-id, threshold-level: u1 }
+      { threshold-percentage: u70 }
+    )
+    (map-set budget-alert-thresholds
+      { user: user, budget-id: budget-id, threshold-level: u2 }
+      { threshold-percentage: u85 }
+    )
+    (map-set budget-alert-thresholds
+      { user: user, budget-id: budget-id, threshold-level: u3 }
+      { threshold-percentage: u95 }
+    )
+    (ok true)
+  )
+)
+
+(define-private (check-budget-threshold (user principal) (budget-id uint) (current-spent uint) (budget-limit uint))
+  (let (
+    (percentage (/ (* current-spent u100) budget-limit))
+    (current-block stacks-block-height)
+  )
+    (match (map-get? budget-alert-thresholds { user: user, budget-id: budget-id, threshold-level: u1 })
+      threshold1 (if (>= percentage (get threshold-percentage threshold1))
+        (map-set threshold-status
+          { user: user, budget-id: budget-id, threshold-level: u1 }
+          { crossed: true, crossed-at: current-block }
+        )
+        true
+      )
+      true
+    )
+    (match (map-get? budget-alert-thresholds { user: user, budget-id: budget-id, threshold-level: u2 })
+      threshold2 (if (>= percentage (get threshold-percentage threshold2))
+        (map-set threshold-status
+          { user: user, budget-id: budget-id, threshold-level: u2 }
+          { crossed: true, crossed-at: current-block }
+        )
+        true
+      )
+      true
+    )
+    (match (map-get? budget-alert-thresholds { user: user, budget-id: budget-id, threshold-level: u3 })
+      threshold3 (if (>= percentage (get threshold-percentage threshold3))
+        (map-set threshold-status
+          { user: user, budget-id: budget-id, threshold-level: u3 }
+          { crossed: true, crossed-at: current-block }
+        )
+        true
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-private (check-category-threshold (user principal) (budget-id uint) (category (string-ascii 30)) (current-spent uint) (category-limit uint))
+  (let (
+    (percentage (/ (* current-spent u100) category-limit))
+    (current-block stacks-block-height)
+  )
+    (match (map-get? budget-alert-thresholds { user: user, budget-id: budget-id, threshold-level: u1 })
+      threshold1 (if (>= percentage (get threshold-percentage threshold1))
+        (map-set category-threshold-status
+          { user: user, budget-id: budget-id, category: category, threshold-level: u1 }
+          { crossed: true, crossed-at: current-block }
+        )
+        true
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-budget-threshold (user principal) (budget-id uint) (threshold-level uint))
+  (map-get? budget-alert-thresholds { user: user, budget-id: budget-id, threshold-level: threshold-level })
+)
+
+(define-read-only (get-budget-threshold-status (user principal) (budget-id uint) (threshold-level uint))
+  (match (get-budget user budget-id)
+    budget-data
+    (let (
+      (percentage (/ (* (get current-spent budget-data) u100) (get total-limit budget-data)))
+      (status (map-get? threshold-status { user: user, budget-id: budget-id, threshold-level: threshold-level }))
+    )
+      (ok {
+        crossed: (default-to false (get crossed status)),
+        crossed-at: (default-to u0 (get crossed-at status)),
+        percentage: percentage
+      })
+    )
+    ERR_BUDGET_NOT_FOUND
+  )
+)
+
+(define-read-only (get-current-spending-percentage (user principal) (budget-id uint))
+  (match (get-budget user budget-id)
+    budget-data
+    (ok (/ (* (get current-spent budget-data) u100) (get total-limit budget-data)))
+    ERR_BUDGET_NOT_FOUND
+  )
+)
+
+(define-public (create-recurring-expense (budget-id uint) (name (string-ascii 50)) (amount uint) (frequency uint) (category (string-ascii 30)))
+  (let (
+    (user tx-sender)
+    (budget-data (unwrap! (get-budget user budget-id) ERR_BUDGET_NOT_FOUND))
+    (recurring-id (var-get next-recurring-id))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> frequency u0) ERR_INVALID_PERIOD)
+    (asserts! (get active budget-data) ERR_BUDGET_NOT_FOUND)
+    
+    (map-set recurring-expenses
+      { budget-id: budget-id, recurring-id: recurring-id }
+      {
+        name: name,
+        amount: amount,
+        frequency: frequency,
+        category: category,
+        enabled: true,
+        last-executed: u0
+      }
+    )
+    
+    (var-set next-recurring-id (+ recurring-id u1))
+    (ok recurring-id)
+  )
+)
+
+(define-public (toggle-recurring-expense (budget-id uint) (recurring-id uint))
+  (let (
+    (user tx-sender)
+    (budget-data (unwrap! (get-budget user budget-id) ERR_BUDGET_NOT_FOUND))
+    (recurring-data (unwrap! (map-get? recurring-expenses { budget-id: budget-id, recurring-id: recurring-id }) ERR_RECURRING_NOT_FOUND))
+  )
+    (asserts! (get active budget-data) ERR_BUDGET_NOT_FOUND)
+    
+    (map-set recurring-expenses
+      { budget-id: budget-id, recurring-id: recurring-id }
+      (merge recurring-data { enabled: (not (get enabled recurring-data)) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (execute-recurring-expense (budget-id uint) (recurring-id uint))
+  (let (
+    (user tx-sender)
+    (budget-data (unwrap! (get-budget user budget-id) ERR_BUDGET_NOT_FOUND))
+    (recurring-data (unwrap! (map-get? recurring-expenses { budget-id: budget-id, recurring-id: recurring-id }) ERR_RECURRING_NOT_FOUND))
+    (current-block stacks-block-height)
+    (blocks-since-exec (- current-block (get last-executed recurring-data)))
+    (expense-result (add-expense budget-id (get category recurring-data) (get amount recurring-data) (get name recurring-data)))
+  )
+    (asserts! (get active budget-data) ERR_BUDGET_NOT_FOUND)
+    (asserts! (get enabled recurring-data) ERR_RECURRING_DISABLED)
+    (asserts! (or (is-eq (get last-executed recurring-data) u0) (>= blocks-since-exec (get frequency recurring-data))) ERR_RECURRING_NOT_DUE)
+    
+    (map-set recurring-expenses
+      { budget-id: budget-id, recurring-id: recurring-id }
+      (merge recurring-data { last-executed: current-block })
+    )
+    
+    expense-result
+  )
+)
+
+(define-public (delete-recurring-expense (budget-id uint) (recurring-id uint))
+  (let (
+    (user tx-sender)
+    (budget-data (unwrap! (get-budget user budget-id) ERR_BUDGET_NOT_FOUND))
+    (recurring-data (unwrap! (map-get? recurring-expenses { budget-id: budget-id, recurring-id: recurring-id }) ERR_RECURRING_NOT_FOUND))
+  )
+    (asserts! (get active budget-data) ERR_BUDGET_NOT_FOUND)
+    
+    (map-delete recurring-expenses { budget-id: budget-id, recurring-id: recurring-id })
+    (ok true)
+  )
+)
+
+(define-read-only (get-recurring-expense (budget-id uint) (recurring-id uint))
+  (map-get? recurring-expenses { budget-id: budget-id, recurring-id: recurring-id })
+)
+
+(define-read-only (is-recurring-due (budget-id uint) (recurring-id uint))
+  (match (map-get? recurring-expenses { budget-id: budget-id, recurring-id: recurring-id })
+    recurring-data
+    (let (
+      (current-block stacks-block-height)
+      (blocks-since-exec (- current-block (get last-executed recurring-data)))
+    )
+      (ok (or (is-eq (get last-executed recurring-data) u0) (>= blocks-since-exec (get frequency recurring-data))))
+    )
+    ERR_RECURRING_NOT_FOUND
+  )
+)
+
+(define-read-only (get-next-recurring-id)
+  (var-get next-recurring-id)
 )
