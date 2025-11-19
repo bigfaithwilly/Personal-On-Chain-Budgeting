@@ -14,6 +14,9 @@
 (define-constant ERR_RECURRING_NOT_FOUND (err u112))
 (define-constant ERR_RECURRING_DISABLED (err u113))
 (define-constant ERR_RECURRING_NOT_DUE (err u114))
+(define-constant ERR_INVALID_TRANSFER (err u115))
+(define-constant ERR_INSUFFICIENT_TRANSFERABLE (err u116))
+(define-constant ERR_SAME_BUDGET_TRANSFER (err u117))
 
 (define-data-var next-budget-id uint u1)
 (define-data-var next-goal-id uint u1)
@@ -114,6 +117,24 @@
 )
 
 (define-data-var next-recurring-id uint u1)
+
+(define-map budget-transfers
+  { user: principal, transfer-id: uint }
+  {
+    from-budget-id: uint,
+    to-budget-id: uint,
+    amount: uint,
+    timestamp: uint,
+    description: (string-ascii 100)
+  }
+)
+
+(define-data-var next-transfer-id uint u1)
+
+(define-map user-transfer-count
+  { user: principal }
+  { count: uint }
+)
 
 (define-public (create-budget (name (string-ascii 50)) (total-limit uint) (reset-period uint))
   (let (
@@ -749,4 +770,62 @@
 
 (define-read-only (get-next-recurring-id)
   (var-get next-recurring-id)
+)
+
+(define-public (transfer-budget (from-budget-id uint) (to-budget-id uint) (amount uint) (description (string-ascii 100)))
+  (let (
+    (user tx-sender)
+    (from-budget (unwrap! (get-budget user from-budget-id) ERR_BUDGET_NOT_FOUND))
+    (to-budget (unwrap! (get-budget user to-budget-id) ERR_BUDGET_NOT_FOUND))
+    (transfer-id (var-get next-transfer-id))
+    (current-block stacks-block-height)
+    (available-amount (- (get total-limit from-budget) (get current-spent from-budget)))
+  )
+    (asserts! (not (is-eq from-budget-id to-budget-id)) ERR_SAME_BUDGET_TRANSFER)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (get active from-budget) ERR_BUDGET_NOT_FOUND)
+    (asserts! (get active to-budget) ERR_BUDGET_NOT_FOUND)
+    (asserts! (>= available-amount amount) ERR_INSUFFICIENT_TRANSFERABLE)
+    
+    (map-set budgets
+      { user: user, budget-id: from-budget-id }
+      (merge from-budget { total-limit: (- (get total-limit from-budget) amount) })
+    )
+    
+    (map-set budgets
+      { user: user, budget-id: to-budget-id }
+      (merge to-budget { total-limit: (+ (get total-limit to-budget) amount) })
+    )
+    
+    (map-set budget-transfers
+      { user: user, transfer-id: transfer-id }
+      {
+        from-budget-id: from-budget-id,
+        to-budget-id: to-budget-id,
+        amount: amount,
+        timestamp: current-block,
+        description: description
+      }
+    )
+    
+    (map-set user-transfer-count
+      { user: user }
+      { count: (+ (get-user-transfer-count user) u1) }
+    )
+    
+    (var-set next-transfer-id (+ transfer-id u1))
+    (ok transfer-id)
+  )
+)
+
+(define-read-only (get-budget-transfer (user principal) (transfer-id uint))
+  (map-get? budget-transfers { user: user, transfer-id: transfer-id })
+)
+
+(define-read-only (get-user-transfer-count (user principal))
+  (default-to u0 (get count (map-get? user-transfer-count { user: user })))
+)
+
+(define-read-only (get-next-transfer-id)
+  (var-get next-transfer-id)
 )
